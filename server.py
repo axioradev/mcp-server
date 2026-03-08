@@ -2,7 +2,7 @@
 
 Connects Claude, Cursor, and other AI assistants to 4,000+ Japanese
 listed companies via the Axiora API. Search companies, analyze financials,
-read translated filings, screen stocks, and more.
+read translated filings, screen stocks, track ownership changes, and more.
 
 Get your free API key at https://axiora.dev
 
@@ -31,31 +31,50 @@ mcp = FastMCP(
         "Axiora provides structured financial data for Japanese listed "
         "companies. Data comes from EDINET (金融庁) filings — audited XBRL, "
         "not scraped or AI-estimated. Use these tools to search companies, "
-        "get financials, rankings, health scores, translated filings, and more."
+        "get financials, rankings, health scores, translated filings, "
+        "ownership trajectories, buybacks, and more."
     ),
 )
 
 API_BASE = os.environ.get("AXIORA_BASE_URL", "https://api.axiora.dev/v1")
 API_KEY = os.environ.get("AXIORA_API_KEY", "")
 
+if not API_KEY:
+    logger.warning(
+        "AXIORA_API_KEY not set. Get a free key at https://axiora.dev"
+    )
+
 
 async def _request(path: str, params: dict | None = None) -> dict | None:
     """Make a GET request to the Axiora API."""
+    if not API_KEY:
+        return {"error": "AXIORA_API_KEY not set. Get a free key at https://axiora.dev"}
+
     url = f"{API_BASE}{path}"
     params = {k: v for k, v in (params or {}).items() if v is not None}
-    headers = {"Accept": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {API_KEY}",
+        "User-Agent": "axiora-mcp-server/0.2.0",
+    }
 
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(url, headers=headers, params=params, timeout=30.0)
+            resp = await client.get(
+                url, headers=headers, params=params, timeout=30.0,
+            )
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            body = e.response.json() if e.response.headers.get("content-type", "").startswith("application/json") else {}
-            error_msg = body.get("error", {}).get("message", str(e))
+            ct = e.response.headers.get("content-type", "")
+            if ct.startswith("application/json"):
+                body = e.response.json()
+                error_msg = body.get("error", {}).get("message", str(e))
+            else:
+                error_msg = f"HTTP {e.response.status_code}"
             return {"error": error_msg}
+        except httpx.TimeoutException:
+            return {"error": "Request timed out. Try again."}
         except Exception as e:
             return {"error": str(e)}
 
@@ -75,20 +94,20 @@ def _unwrap(data: dict | None, key: str = "data") -> list | dict:
 
 
 @mcp.tool()
-async def search_companies(query: str, limit: int = 10) -> str:
+async def search_companies(
+    query: str, sector: str | None = None, limit: int = 10,
+) -> str:
     """Search for Japanese listed companies by name or code.
 
     Args:
         query: Company name (JP or EN), securities code, or EDINET code.
-        limit: Max results to return (default 10, max 100).
+        sector: Optional sector filter (e.g. '電気機器', '情報・通信業').
+        limit: Max results to return (default 10, max 50).
     """
-    data = await _request("/companies/search", {"q": query, "limit": limit})
-    result = _unwrap(data)
-
-    if not result:
-        return "No companies found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    data = await _request(
+        "/companies/search", {"q": query, "sector": sector, "limit": limit},
+    )
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -114,10 +133,7 @@ async def search_companies_batch(queries: list[str]) -> str:
                 item["query"] = q.strip()
             results.extend(items)
 
-    if not results:
-        return "No companies found."
-
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return json.dumps(results or [], indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -128,12 +144,7 @@ async def get_company(code: str) -> str:
         code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
     """
     data = await _request(f"/companies/{code}")
-    result = _unwrap(data)
-
-    if not result:
-        return f"Company '{code}' not found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -142,19 +153,13 @@ async def get_sector_overview(sector: str | None = None) -> str:
 
     Args:
         sector: If provided, returns aggregate stats for that sector.
-            If omitted, returns all 33 TSE sectors with company counts.
+            If omitted, returns all sectors with company counts.
     """
     if sector:
         data = await _request(f"/sectors/{sector}")
     else:
         data = await _request("/sectors")
-
-    result = _unwrap(data)
-
-    if not result:
-        return "No sector data found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +179,7 @@ async def get_financials(code: str, years: int = 5) -> str:
         years: Number of years to return (default 5, max 20).
     """
     data = await _request(f"/companies/{code}/financials", {"years": years})
-    result = _unwrap(data)
-
-    if not result:
-        return f"No financials found for '{code}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -191,12 +191,7 @@ async def get_growth(code: str, years: int = 5) -> str:
         years: Number of years of history (default 5, max 20).
     """
     data = await _request(f"/companies/{code}/growth", {"years": years})
-    result = _unwrap(data)
-
-    if not result:
-        return f"No growth data found for '{code}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -210,12 +205,7 @@ async def get_health_score(code: str) -> str:
         code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
     """
     data = await _request(f"/companies/{code}/health")
-    result = _unwrap(data)
-
-    if not result:
-        return f"No health score found for '{code}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -229,43 +219,29 @@ async def get_peers(code: str, limit: int = 10) -> str:
         limit: Max results (default 10, max 50).
     """
     data = await _request(f"/companies/{code}/peers", {"limit": limit})
-    result = _unwrap(data)
-
-    if not result:
-        return f"No peers found for '{code}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
-async def compare_companies(
-    codes: list[str],
-    fiscal_year: int | None = None,
-) -> str:
-    """Compare financials of 2-10 companies side by side.
+async def compare_companies(codes: list[str], years: int = 3) -> str:
+    """Compare financials of 2-5 companies side by side.
 
     Args:
-        codes: List of EDINET or securities codes (2-10 companies).
-        fiscal_year: Optional fiscal year to compare. Defaults to latest.
+        codes: List of EDINET or securities codes (2-5 companies).
+        years: Number of years to include (default 3, max 10).
     """
-    if len(codes) < 2 or len(codes) > 10:
-        return json.dumps({"error": "Provide 2-10 company codes."})
+    if len(codes) < 2 or len(codes) > 5:
+        return json.dumps({"error": "Provide 2-5 company codes."})
 
-    codes_str = ",".join(codes)
-    data = await _request("/compare", {"codes": codes_str, "fiscal_year": fiscal_year})
-    result = _unwrap(data)
-
-    if not result:
-        return "No comparison data found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    data = await _request(
+        "/compare", {"codes": ",".join(codes), "years": years},
+    )
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
 async def get_timeseries(
-    codes: list[str],
-    metric: str = "revenue",
-    years: int = 10,
+    codes: list[str], metric: str = "revenue", years: int = 10,
 ) -> str:
     """Get time-series data for a financial metric across companies.
 
@@ -283,18 +259,10 @@ async def get_timeseries(
     if not codes or len(codes) > 5:
         return json.dumps({"error": "Provide 1-5 company codes."})
 
-    codes_str = ",".join(codes)
     data = await _request("/timeseries", {
-        "codes": codes_str,
-        "metric": metric,
-        "years": years,
+        "codes": ",".join(codes), "metric": metric, "years": years,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No time-series data found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -305,9 +273,10 @@ async def get_timeseries(
 @mcp.tool()
 async def screen_companies(
     sector: str | None = None,
-    revenue_min: int | None = None,
-    net_income_min: int | None = None,
-    roe_min: float | None = None,
+    min_revenue: int | None = None,
+    min_net_income: int | None = None,
+    min_roe: float | None = None,
+    max_pe_ratio: float | None = None,
     limit: int = 20,
 ) -> str:
     """Screen companies by financial criteria.
@@ -315,25 +284,19 @@ async def screen_companies(
     All filters are combined with AND logic.
 
     Args:
-        sector: Filter by sector (e.g. '情報・通信業', 'Information & Communication').
-        revenue_min: Minimum revenue in JPY.
-        net_income_min: Minimum net income in JPY.
-        roe_min: Minimum ROE percentage (e.g. 10.0 for 10%).
+        sector: Filter by sector (e.g. '情報・通信業').
+        min_revenue: Minimum revenue in JPY.
+        min_net_income: Minimum net income in JPY.
+        min_roe: Minimum ROE percentage (e.g. 10.0 for 10%).
+        max_pe_ratio: Maximum PE ratio (e.g. 15.0).
         limit: Max results (default 20, max 100).
     """
     data = await _request("/screen", {
-        "sector": sector,
-        "revenue_min": revenue_min,
-        "net_income_min": net_income_min,
-        "roe_min": roe_min,
-        "limit": limit,
+        "sector": sector, "min_revenue": min_revenue,
+        "min_net_income": min_net_income, "min_roe": min_roe,
+        "max_pe_ratio": max_pe_ratio, "limit": limit,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No companies match the criteria."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -354,23 +317,14 @@ async def get_ranking(
         limit: Number of results (default 20, max 100).
     """
     data = await _request(f"/rankings/{metric}", {
-        "sector": sector,
-        "order": order,
-        "limit": limit,
+        "sector": sector, "order": order, "limit": limit,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No ranking data found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
 async def get_health_ranking(
-    sector: str | None = None,
-    order: str = "desc",
-    limit: int = 20,
+    sector: str | None = None, order: str = "desc", limit: int = 20,
 ) -> str:
     """Rank companies by financial health score.
 
@@ -380,16 +334,9 @@ async def get_health_ranking(
         limit: Max results (default 20, max 100).
     """
     data = await _request("/rankings/health_score", {
-        "sector": sector,
-        "order": order,
-        "limit": limit,
+        "sector": sector, "order": order, "limit": limit,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No health ranking data found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +346,7 @@ async def get_health_ranking(
 
 @mcp.tool()
 async def get_sections(
-    code: str,
-    section: str | None = None,
-    fiscal_year: int | None = None,
+    code: str, section: str | None = None, fiscal_year: int | None = None,
 ) -> str:
     """Get text sections from a company's annual filing (MD&A, risk factors, etc.).
 
@@ -415,22 +360,13 @@ async def get_sections(
         fiscal_year: Optional fiscal year. Defaults to latest annual filing.
     """
     data = await _request(f"/companies/{code}/sections", {
-        "section": section,
-        "fiscal_year": fiscal_year,
+        "section": section, "fiscal_year": fiscal_year,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return f"No sections found for '{code}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
-async def get_translations(
-    doc_id: str,
-    section: str | None = None,
-) -> str:
+async def get_translations(doc_id: str, section: str | None = None) -> str:
     """Get English translations of a Japanese filing.
 
     Args:
@@ -438,20 +374,15 @@ async def get_translations(
         section: Optional filter: mda, risk_factors, business_overview,
             governance, financial_notes, accounting_policy.
     """
-    data = await _request(f"/filings/{doc_id}/translations", {"section": section})
-    result = _unwrap(data)
-
-    if not result:
-        return f"No translations found for filing '{doc_id}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    data = await _request(
+        f"/filings/{doc_id}/translations", {"section": section},
+    )
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
 async def search_translations(
-    query: str,
-    section: str | None = None,
-    limit: int = 10,
+    query: str, section: str | None = None, limit: int = 10,
 ) -> str:
     """Full-text search across English translations of Japanese filings.
 
@@ -463,16 +394,9 @@ async def search_translations(
         limit: Max results (default 10, max 50).
     """
     data = await _request("/translations/search", {
-        "q": query,
-        "section": section,
-        "limit": limit,
+        "q": query, "section": section, "limit": limit,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No translation matches found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -490,20 +414,14 @@ async def list_filings(
 
     Args:
         company_code: EDINET code or securities code to filter by.
-        doc_type: Document type code (120=annual, 130=semi-annual, 140=quarterly).
+        doc_type: Document type code (120=annual, 130=semi-annual,
+            140=quarterly, 220=buyback).
         limit: Max results (default 20, max 100).
     """
     data = await _request("/filings", {
-        "company_code": company_code,
-        "doc_type": doc_type,
-        "limit": limit,
+        "company_code": company_code, "doc_type": doc_type, "limit": limit,
     })
-    result = _unwrap(data)
-
-    if not result:
-        return "No filings found."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -516,12 +434,7 @@ async def get_filing_calendar(month: str) -> str:
         month: Month in YYYY-MM format (e.g. '2025-06').
     """
     data = await _request("/filings/calendar", {"month": month})
-    result = _unwrap(data)
-
-    if not result:
-        return f"No filing calendar data for '{month}'."
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -532,12 +445,257 @@ async def get_coverage() -> str:
     and per-metric coverage percentages. Useful for assessing data quality.
     """
     data = await _request("/coverage")
-    result = _unwrap(data)
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
-    if not result:
-        return "Unable to fetch coverage data."
 
-    return json.dumps(result, indent=2, ensure_ascii=False)
+# ---------------------------------------------------------------------------
+# Buybacks
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_buybacks(code: str, limit: int = 20) -> str:
+    """Get share buyback reports for a company.
+
+    Returns monthly buyback status filings showing shares acquired,
+    amounts spent, cumulative progress, and treasury share holdings.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request(f"/companies/{code}/buybacks", {"limit": limit})
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Ownership intelligence
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def get_shareholdings(code: str, limit: int = 20) -> str:
+    """Get large shareholding reports for a company.
+
+    Returns filings by investors who hold >=5% of the company's shares.
+    Shows who is buying/selling significant stakes, holding ratios,
+    purposes, and funding sources.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request(f"/companies/{code}/shareholdings", {"limit": limit})
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_ownership_trajectories(
+    code: str,
+    trajectory_type: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Get ownership trajectories for a company.
+
+    Returns per-filer ownership time-series showing accumulation/exit
+    patterns, velocity, and streak data.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+        trajectory_type: Optional filter: 'accumulating', 'exiting',
+            'stable', 'new_position'.
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request(f"/companies/{code}/ownership/trajectories", {
+        "trajectory_type": trajectory_type, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_ownership_movers(
+    days: int = 30,
+    trajectory_type: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Get market-wide biggest ownership moves.
+
+    Returns filers with the largest accumulations or exits in the
+    last N days, ranked by velocity (percentage points per month).
+
+    Args:
+        days: Look back period (default 30, max 365).
+        trajectory_type: Optional: 'accumulating' or 'exiting'.
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request("/ownership/movers", {
+        "days": days, "trajectory_type": trajectory_type, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_ownership_signals(
+    code: str | None = None,
+    signal_type: str | None = None,
+    days: int = 90,
+    limit: int = 20,
+) -> str:
+    """Get detected ownership signals.
+
+    Returns signals like accumulation streaks, large step-ups/downs,
+    exits below 5%, activist escalations, and pace accelerations.
+
+    Args:
+        code: Optional EDINET or securities code to filter by issuer.
+        signal_type: Optional filter: accumulation_streak, large_step_up,
+            large_step_down, exit_below_5pct, activist_escalation,
+            new_position, pace_acceleration.
+        days: Look back period (default 90, max 365).
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request("/ownership/signals", {
+        "code": code, "signal_type": signal_type,
+        "days": days, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_cross_holdings(
+    code: str | None = None, limit: int = 20,
+) -> str:
+    """Get cross-holding pairs where two companies hold >=5% of each other.
+
+    Cross-shareholdings are a key feature of Japanese corporate governance.
+    Returns pairs sorted by combined holding ratio.
+
+    Args:
+        code: Optional EDINET or securities code to filter by company.
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request("/ownership/cross-holdings", {
+        "code": code, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_probability_table() -> str:
+    """Get the conditional completion table for ownership trajectories.
+
+    Shows P(reaching threshold | current trajectory features) computed from
+    all historical trajectories. Bucketed by stake range, streak length,
+    and purpose type. Thresholds: 10%, 20%, 33% (blocking minority).
+    """
+    data = await _request("/ownership/probability-table")
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_capital_allocation(code: str) -> str:
+    """Get capital allocation classification for a company.
+
+    Classifies companies as Returner, Hoarder, Reinvestor, Mixed,
+    or Insufficient Data based on FCF deployment analysis.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+    """
+    data = await _request(f"/companies/{code}/capital-allocation")
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_capital_allocation_ranking(
+    classification: str | None = None,
+    sector: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Rank companies by capital allocation classification.
+
+    Args:
+        classification: Optional filter: 'returner', 'hoarder',
+            'reinvestor', 'mixed'.
+        sector: Optional sector filter (e.g. '電気機器').
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request("/rankings/capital-allocation", {
+        "classification": classification, "sector": sector, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_activist_campaigns(limit: int = 20) -> str:
+    """Get detected activist campaigns in Japanese companies.
+
+    Returns companies where filers changed purpose to activist or filed
+    important proposals, with holding trajectories and outcomes.
+
+    Args:
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request("/ownership/activist-campaigns", {"limit": limit})
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_unwinding_scoreboard(limit: int = 20) -> str:
+    """Get cross-holdings that are being unwound.
+
+    Returns cross-holding pairs where at least one side shows declining
+    ownership. Tracks the dissolution of Japan's traditional
+    cross-shareholding structures.
+
+    Args:
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request(
+        "/ownership/unwinding-scoreboard", {"limit": limit},
+    )
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_board_composition(
+    code: str, fiscal_year: int | None = None,
+) -> str:
+    """Get board composition and officer list for a company.
+
+    Returns directors, auditors, executive officers with outside/independent
+    status, gender breakdown, and shares held.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+        fiscal_year: Optional fiscal year. Defaults to latest.
+    """
+    data = await _request(f"/companies/{code}/board", {
+        "fiscal_year": fiscal_year,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_voting_results(
+    code: str,
+    fiscal_year: int | None = None,
+    limit: int = 20,
+) -> str:
+    """Get AGM voting results for a company.
+
+    Returns proposal-level results including votes for/against/abstain,
+    approval percentages, and outcomes.
+
+    Args:
+        code: EDINET code (e.g. 'E02144') or securities code (e.g. '7203').
+        fiscal_year: Optional fiscal year filter.
+        limit: Max results (default 20, max 100).
+    """
+    data = await _request(f"/companies/{code}/voting", {
+        "fiscal_year": fiscal_year, "limit": limit,
+    })
+    return json.dumps(_unwrap(data), indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
