@@ -213,8 +213,9 @@ pip install axiora
 from axiora import Axiora
 
 client = Axiora(api_key="your-api-key")
-toyota = client.companies.get("7203")
-financials = client.companies.get_financials("7203", years=10)
+toyota = client.companies.retrieve("7203")
+financials = client.companies.retrieve_financials("7203", years=10)
+results = client.screen.retrieve(min_roe=15.0, sector="電気機器")
 ```
 
 ## Data Coverage
