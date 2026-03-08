@@ -1,0 +1,16 @@
+# Smithery configuration for Axiora MCP Server
+# https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - apiKey
+    properties:
+      apiKey:
+        type: string
+        title: "API Key"
+        description: "Axiora API key from https://axiora.dev (free)"
+  commandFunction: |-
+    config => ({ command: 'uv', args: ['run', 'server.py'], env: { AXIORA_API_KEY: config.apiKey } })
